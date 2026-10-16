@@ -44,34 +44,58 @@ M.lsp = {}
 local _lsp_error_cache = {}
 local _LSP_ERROR_DEBOUNCE_MS = 3000
 
+--- Reports an LSP request error to the user, de-duplicating repeated messages.
+--- Cancellation errors (code -32800) are ignored.
+---@param method string The LSP method that failed.
+---@param err table|nil The error object returned by the client.
+function M.lsp.notify_error(method, err)
+    if not err or err.code == -32800 then -- Request cancelled — silent
+        return
+    end
+    -- Deduplicate noisy LSP error notifications (e.g. server-side
+    -- "key not found" errors from servers that don't track all documents).
+    local key = method .. ":" .. (err.message or "")
+    local now = vim.uv and vim.uv.now() or vim.loop.now()
+    if not _lsp_error_cache[key] or (now - _lsp_error_cache[key]) >= _LSP_ERROR_DEBOUNCE_MS then
+        _lsp_error_cache[key] = now
+        vim.schedule(function()
+            vim.notify(
+                string.format("LSP %s: %s", method, err.message or "error"),
+                vim.log.levels.WARN
+            )
+        end)
+    end
+end
+
 --- Sends an async request to an LSP client.
+--- Errors are reported to the user and the callback receives `nil`.
 ---@param client table The LSP client.
 ---@param method string The LSP method to call.
 ---@param params table|nil The parameters for the method.
 ---@param bufnr number|nil The buffer number for the request.
 ---@param callback function The callback to execute with the result.
 function M.lsp.request_async(client, method, params, bufnr, callback)
-    client.request(method, params or {}, function(err, res)
+    M.lsp.request_async_raw(client, method, params, bufnr, function(res, err)
         if err then
-            if err.code == -32800 then -- Request cancelled — silent
-                return callback(nil)
-            end
-            -- Deduplicate noisy LSP error notifications (e.g. server-side
-            -- "key not found" errors from servers that don't track all documents).
-            local key = method .. ":" .. (err.message or "")
-            local now = vim.uv and vim.uv.now() or vim.loop.now()
-            if not _lsp_error_cache[key] or (now - _lsp_error_cache[key]) >= _LSP_ERROR_DEBOUNCE_MS then
-                _lsp_error_cache[key] = now
-                vim.schedule(function()
-                    vim.notify(
-                        string.format("LSP %s: %s", method, err.message or "error"),
-                        vim.log.levels.WARN
-                    )
-                end)
-            end
+            M.lsp.notify_error(method, err)
             return callback(nil)
         end
         callback(res or {})
+    end)
+end
+
+--- Sends an async request to an LSP client, surfacing the error to the caller.
+--- Unlike `request_async`, the callback receives both the raw result and any
+--- error so callers can implement fallbacks (e.g. retry with a re-resolved
+--- item). Errors are *not* reported automatically.
+---@param client table The LSP client.
+---@param method string The LSP method to call.
+---@param params table|nil The parameters for the method.
+---@param bufnr number|nil The buffer number for the request.
+---@param callback fun(result: table|nil, err: table|nil) Called with the raw result and error.
+function M.lsp.request_async_raw(client, method, params, bufnr, callback)
+    client.request(method, params or {}, function(err, res)
+        callback(res, err)
     end, bufnr or 0)
 end
 

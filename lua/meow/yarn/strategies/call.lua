@@ -48,6 +48,39 @@ local call_hierarchy_strategy = {
     },
 }
 
+-- Routing `data` handed out by prepareCallHierarchy, remembered per client.
+-- vtsls strips it from the caller/callee items it returns and then rejects those
+-- very items with "Cannot read properties of undefined (reading 'id')", so we
+-- replay the last known value. This is required for library declarations
+-- (e.g. toFixed in lib.es5.d.ts): their files are not open in the editor, so
+-- they cannot be re-prepared and the routing data can only be replayed.
+local _routing_data = {}
+
+--- Remembers the routing `data` a server handed out for an item.
+---@param client table The LSP client.
+---@param item table|nil The prepared LSP item.
+local function remember_routing_data(client, item)
+    if type(item) == "table" and type(item.data) == "table" then
+        _routing_data[client] = item.data
+    end
+end
+
+--- Returns an item carrying the last routing `data` the client handed out, when
+--- the item has none of its own.
+---@param client table The LSP client.
+---@param item table The LSP item.
+---@return table The item, with `data` restored when possible.
+local function with_routing_data(client, item)
+    if type(item) ~= "table" or type(item.data) == "table" then
+        return item
+    end
+    local data = _routing_data[client]
+    if type(data) ~= "table" then
+        return item
+    end
+    return vim.tbl_extend("force", item, { data = data })
+end
+
 --- Prepares the root item for a call hierarchy request.
 ---@param client table The LSP client.
 ---@param winid number The window ID of the source buffer.
@@ -58,7 +91,104 @@ function call_hierarchy_strategy.prepare_root_item(client, winid, callback)
     local encoding = util.lsp.get_encoding(client)
     local params = vim.lsp.util.make_position_params(winid, encoding)
     util.lsp.request_async(client, call_hierarchy_strategy.lsp_methods.prepare, params, bufnr, function(items)
-        callback((items and items[1]) or nil)
+        local root_item = (items and items[1]) or nil
+        remember_routing_data(client, root_item)
+        callback(root_item)
+    end)
+end
+
+--- Builds a comparable signature out of a list of LSP ranges.
+---@param ranges table|nil The ranges to compare.
+---@return string|nil The signature, or nil when there is nothing to compare.
+local function ranges_signature(ranges)
+    if type(ranges) ~= "table" or #ranges == 0 then
+        return nil
+    end
+    local parts = {}
+    for _, range in ipairs(ranges) do
+        local first, last = range.start, range["end"]
+        if not first or not last then
+            return nil
+        end
+        parts[#parts + 1] = string.format("%d:%d-%d:%d", first.line, first.character, last.line, last.character)
+    end
+    table.sort(parts)
+    return table.concat(parts, ";")
+end
+
+--- Maps the raw result of an incoming/outgoing calls request to child items.
+---@param results table|nil The raw LSP result.
+---@param direction_key string The direction the request was made for.
+---@return table[] The child LSP items.
+local function map_call_results(results, direction_key)
+    local children_items = {}
+    if type(results) ~= "table" then
+        return children_items
+    end
+    -- A single call site resolves to a single symbol, but some servers (notably
+    -- vtsls) return one result per *declaration* of that symbol: e.g. a call to
+    -- `str.replace(..)` yields both `replace` (lib.es5.d.ts) and `[Symbol.replace]`
+    -- (lib.es2015.symbol.wellknown.d.ts), which TypeScript also names `replace`.
+    -- They share the same call site and expand to the same sub-hierarchy, so keep
+    -- the first and drop the rest.
+    local seen = {}
+    for _, result in ipairs(results) do
+        if result then
+            local child = (direction_key == "callers") and result.from or result.to
+            local signature = child and ranges_signature(result.fromRanges) or nil
+            local key = signature and string.format("%s#%s#%s", child.name or "", tostring(child.kind or ""), signature)
+                or nil
+            if child and not (key and seen[key]) then
+                if key then
+                    seen[key] = true
+                end
+                -- For incoming calls `fromRanges` are the call sites inside the caller
+                -- itself, so they can be used for jumping / previewing. For outgoing
+                -- calls they point into the *parent* file, so they are ignored there.
+                if direction_key == "callers" and type(result.fromRanges) == "table" and #result.fromRanges > 0 then
+                    child = vim.tbl_extend("force", child, { call_site_ranges = result.fromRanges })
+                end
+                table.insert(children_items, child)
+            end
+        end
+    end
+    return children_items
+end
+
+--- Re-resolves an item through `textDocument/prepareCallHierarchy` so it carries
+--- the routing `data` some servers require on follow-up requests.
+--- vtsls (<= 0.3.0) omits `data` on the items it returns inside incoming /
+--- outgoing call results, then rejects those very items with
+--- "Cannot read properties of undefined (reading 'id')". Re-preparing the item
+--- from its position yields an item the server accepts.
+---@param client table The LSP client.
+---@param item table The item to re-resolve.
+---@param callback fun(reprepared: table|nil) Called with the re-prepared item, or nil.
+local function reprepare_item(client, item, callback)
+    if type(item) ~= "table" then
+        return callback(nil)
+    end
+    if not item.uri or type(item.selectionRange) ~= "table" or not item.selectionRange.start then
+        return callback(nil)
+    end
+    local bufnr = vim.uri_to_bufnr(item.uri)
+    if not vim.api.nvim_buf_is_loaded(bufnr) then
+        pcall(vim.fn.bufload, bufnr)
+    end
+    local params = {
+        textDocument = { uri = item.uri },
+        position = item.selectionRange.start,
+    }
+    util.lsp.request_async(client, call_hierarchy_strategy.lsp_methods.prepare, params, bufnr, function(items)
+        local prepared = items and items[1]
+        if type(prepared) == "table" and type(prepared.data) == "table" then
+            remember_routing_data(client, prepared)
+            if item.call_site_ranges then
+                prepared = vim.tbl_extend("force", prepared, { call_site_ranges = item.call_site_ranges })
+            end
+            return callback(prepared)
+        end
+        callback(nil)
     end)
 end
 
@@ -73,23 +203,38 @@ function call_hierarchy_strategy.fetch_children(client, item, direction_key, cal
         vim.notify("Invalid direction for call hierarchy: " .. direction_key, vim.log.levels.ERROR)
         return callback(nil)
     end
-    local req_buf = (item.uri and vim.uri_to_bufnr(item.uri)) or 0
-    if req_buf ~= 0 and not vim.api.nvim_buf_is_loaded(req_buf) then
-        pcall(vim.fn.bufload, req_buf)
+    if type(item) ~= "table" then
+        return callback(nil)
     end
-    util.lsp.request_async(client, method, { item = item }, req_buf, function(results)
-        if not results then return callback(nil) end
-        local children_items = vim.tbl_map(function(result)
-            local child = direction_key == "callers" and result.from or result.to
-            -- For incoming calls `fromRanges` are the call sites inside the caller
-            -- itself, so they can be used for jumping / previewing. For outgoing
-            -- calls they point into the *parent* file, so they are ignored there.
-            if direction_key == "callers" and type(result.fromRanges) == "table" and #result.fromRanges > 0 then
-                child = vim.tbl_extend("force", child, { call_site_ranges = result.fromRanges })
+
+    local function send(req_item, on_error)
+        req_item = with_routing_data(client, req_item)
+        local req_buf = (req_item.uri and vim.uri_to_bufnr(req_item.uri)) or 0
+        if req_buf ~= 0 and not vim.api.nvim_buf_is_loaded(req_buf) then
+            pcall(vim.fn.bufload, req_buf)
+        end
+        util.lsp.request_async_raw(client, method, { item = req_item }, req_buf, function(results, err)
+            if err then
+                return on_error(err)
             end
-            return child
-        end, results)
-        callback(children_items)
+            callback(map_call_results(results, direction_key))
+        end)
+    end
+
+    send(item, function(err)
+        -- Some servers reject caller/callee items they returned without the
+        -- routing `data`. Re-resolve the item via prepareCallHierarchy and
+        -- retry once before giving up.
+        reprepare_item(client, item, function(prepared)
+            if not prepared then
+                util.lsp.notify_error(method, err)
+                return callback(nil)
+            end
+            send(prepared, function(retry_err)
+                util.lsp.notify_error(method, retry_err)
+                callback(nil)
+            end)
+        end)
     end)
 end
 
